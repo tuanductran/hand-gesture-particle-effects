@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Gesture Particle Effects</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: radial-gradient(circle at top, #1d1740 0%, #0a0a0a 45%, #050507 100%);
+            overflow: hidden;
+            color: white;
+        }
+
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #videoElement,
+        #canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #videoElement {
+            object-fit: cover;
+            transform: scaleX(-1);
+            filter: saturate(1.05) contrast(1.04);
+        }
+
+        #canvas {
+            transform: translateZ(0);
+            will-change: transform;
+            pointer-events: none;
+        }
+
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(8, 8, 20, 0.62);
+            padding: 15px;
+            border-radius: 16px;
+            font-size: 14px;
+            max-width: 380px;
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            z-index: 2;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+        }
+
+        #status {
+            color: #7CFFB6;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .gesture {
+            color: #7edbff;
+            font-size: 18px;
+            margin-top: 10px;
+            text-shadow: 0 0 16px rgba(64, 198, 255, 0.55);
+        }
+
+        .particle-count,
+        .gesture-meta,
+        .mode-meta {
+            margin-top: 10px;
+            color: #a8b0ca;
+            font-size: 12px;
+        }
+
+        .instructions {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #c0c4d6;
+            line-height: 1.7;
+        }
+
+        #error {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(255, 0, 0, 0.2);
+            padding: 30px;
+            border-radius: 15px;
+            text-align: center;
+            display: none;
+            border: 2px solid rgba(255, 0, 0, 0.5);
+            z-index: 3;
+        }
+
+        .button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            padding: 12px 24px;
+            color: white;
+            font-size: 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-top: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <video id="videoElement" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+
+        <div id="info">
+            <div id="status">Initializing...</div>
+            <div class="gesture" id="gestureDisplay">No gesture detected</div>
+            <div class="particle-count" id="particleCount">Particles: 0</div>
+            <div class="gesture-meta" id="gestureMeta">Tracking: waiting for hand</div>
+            <div class="mode-meta" id="modeMeta">Mode: idle</div>
+            <div class="instructions">
+                <strong>✨ Gestures:</strong><br>
+                ✋ <strong>Open Palm</strong> - layered firework bloom + slow falling embers<br>
+                ☝️ <strong>Index Finger</strong> - precise fingertip comet follow<br>
+                ✊ <strong>Fist</strong> - magical shockwave pulse from the palm
+            </div>
+        </div>
+
+        <div id="error">
+            <h2>⚠️ Camera Access Required</h2>
+            <p>This app needs access to your webcam to track hand gestures.</p>
+            <button class="button" onclick="location.reload()">Grant Access</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
+const videoElement = document.getElementById('videoElement');
+const statusDiv = document.getElementById('status');
+const gestureDisplay = document.getElementById('gestureDisplay');
+const particleCountDiv = document.getElementById('particleCount');
+const gestureMetaDiv = document.getElementById('gestureMeta');
+const modeMetaDiv = document.getElementById('modeMeta');
+const errorDiv = document.getElementById('error');
+
+const CANVAS_DPR_CAP = 1.5;
+const MAX_PARTICLES = 260;
+const PALM_BURST_COOLDOWN = 560;
+const FINGER_EMIT_INTERVAL = 32;
+const FIST_PULSE_COOLDOWN = 680;
+const POSITION_LERP_FAST = 0.46;
+const POSITION_LERP_IDLE = 0.12;
+const LANDMARK_LERP = 0.52;
+const LOST_HAND_DECAY = 220;
+const GESTURE_LOCK_FRAMES = 3;
+const JUMP_REJECT_DISTANCE = 110;
+const HAND_INFERENCE_INTERVAL = 1000 / 24;
+
+const GESTURE_NAMES = {
+    open_palm: '🎆 Dream Palm Bloom',
+    index_finger: '✨ Starlight Fingertip Follow',
+    fist: '💥 Mystic Fist Pulse',
+    none: 'No gesture detected'
+};
+
+const HAND_CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],
+    [13,17],[17,18],[18,19],[19,20],
+    [0,17]
+];
+
+let particles = [];
+let rawGesture = 'none';
+let stableGesture = 'none';
+let gestureFrames = 0;
+let handVisible = false;
+let lastPalmBurstTime = 0;
+let lastFingerEmitTime = 0;
+let lastFistPulseTime = 0;
+let currentColor = '#9f7bff';
+let palette = makePalette(currentColor);
+let smoothedPosition = { x: 0, y: 0 };
+let targetPosition = { x: 0, y: 0 };
+let previousSmoothedPosition = { x: 0, y: 0 };
+let filteredLandmarks = null;
+let drawLandmarks = null;
+let lastSeenTime = 0;
+let confidenceScore = 0;
+let canvasWidth = 0;
+let canvasHeight = 0;
+let canvasDpr = 1;
+let handProcessing = false;
+let lastHandInferenceTime = 0;
+
+function randRange(a, b) { return a + Math.random() * (b - a); }
+function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function distance(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function syncCanvasSize() {
+    canvasDpr = Math.min(window.devicePixelRatio || 1, CANVAS_DPR_CAP);
+    canvasWidth = window.innerWidth;
+    canvasHeight = window.innerHeight;
+
+    canvas.width = Math.round(canvasWidth * canvasDpr);
+    canvas.height = Math.round(canvasHeight * canvasDpr);
+    ctx.setTransform(canvasDpr, 0, 0, canvasDpr, 0, 0);
+
+    const centerX = canvasWidth / 2;
+    const centerY = canvasHeight / 2;
+
+    if (!smoothedPosition.x && !smoothedPosition.y) {
+        smoothedPosition = { x: centerX, y: centerY };
+        targetPosition = { x: centerX, y: centerY };
+        previousSmoothedPosition = { x: centerX, y: centerY };
+        return;
+    }
+
+    smoothedPosition.x = clamp(smoothedPosition.x, 0, canvasWidth);
+    smoothedPosition.y = clamp(smoothedPosition.y, 0, canvasHeight);
+    targetPosition.x = clamp(targetPosition.x, 0, canvasWidth);
+    targetPosition.y = clamp(targetPosition.y, 0, canvasHeight);
+    previousSmoothedPosition.x = clamp(previousSmoothedPosition.x, 0, canvasWidth);
+    previousSmoothedPosition.y = clamp(previousSmoothedPosition.y, 0, canvasHeight);
+}
+
+syncCanvasSize();
+
+function hsla(color, alpha) {
+    if (typeof color !== 'string') return `rgba(255,255,255,${alpha})`;
+    if (color.startsWith('hsl(')) return color.replace('hsl(', 'hsla(').replace(')', `, ${alpha})`);
+    if (color.startsWith('hsla(')) return color.replace(/,\s*([0-9.]+)\)$/, `, ${alpha})`);
+    if (color.startsWith('rgb(')) return color.replace('rgb(', 'rgba(').replace(')', `, ${alpha})`);
+    if (color.startsWith('rgba(')) return color.replace(/,\s*([0-9.]+)\)$/, `, ${alpha})`);
+    return color;
+}
+
+function randomColor() {
+    const hue = (Math.random() * 360) | 0;
+    return `hsl(${hue}, 100%, ${62 + ((Math.random() * 14) | 0)}%)`;
+}
+
+function shiftHue(hsl, shift, lightnessDelta = 0, saturation = 100) {
+    const match = /hsl\(([-\d.]+),\s*([\d.]+)%?,\s*([\d.]+)%\)/.exec(hsl);
+    if (!match) return hsl;
+    const hue = (parseFloat(match[1]) + shift + 360) % 360;
+    const light = clamp(parseFloat(match[3]) + lightnessDelta, 35, 86);
+    return `hsl(${hue}, ${saturation}%, ${light}%)`;
+}
+
+function makePalette(base) {
+    return {
+        core: base,
+        accent: shiftHue(base, 24, 6),
+        soft: shiftHue(base, -20, 10, 92),
+        sparkle: shiftHue(base, 140, 12),
+        warm: shiftHue(base, 68, 8),
+        pulse: shiftHue(base, -70, 4),
+        white: 'rgba(255,255,255,1)'
+    };
+}
+
+class Particle {
+    constructor({
+        x, y, vx = 0, vy = 0, size = 10, lifetime = 60, color = '#00eaff', gravity = 0,
+        drag = 0.985, glow = 0, trail = false, fadeIn = 0.08, fadeOut = 0.28,
+        twinkle = 0, pulse = 0, orbit = null, lineWidth = 1, type = 'orb',
+        radiusV = 0, ringGrowth = 0, rotation = 0
+    }) {
+        Object.assign(this, { x, y, vx, vy, size, life: lifetime, maxLife: lifetime, color, gravity, drag, glow, trail, fadeIn, fadeOut, twinkle, pulse, orbit, lineWidth, type, radiusV, ringGrowth, rotation });
+        this.history = [];
+        this.seed = Math.random() * Math.PI * 2;
+    }
+
+    update() {
+        this.life--;
+        if (this.life <= 0) return false;
+
+        if (this.orbit) {
+            this.orbit.angle += this.orbit.speed;
+            this.orbit.radius *= this.orbit.radiusDecay || 0.996;
+            this.x = this.orbit.cx + Math.cos(this.orbit.angle) * this.orbit.radius;
+            this.y = this.orbit.cy + Math.sin(this.orbit.angle) * this.orbit.radius;
+            this.orbit.cx += this.orbit.followVx || 0;
+            this.orbit.cy += this.orbit.followVy || 0;
+        } else {
+            this.vx *= this.drag;
+            this.vy *= this.drag;
+            this.vy += this.gravity;
+            this.x += this.vx;
+            this.y += this.vy;
+        }
+
+        if (this.type === 'ring') this.size += this.ringGrowth;
+        if (this.type === 'sparkline') this.rotation += this.radiusV;
+
+        if (this.trail) {
+            this.history.unshift({ x: this.x, y: this.y });
+            if (this.history.length > 6) this.history.pop();
+        }
+        return true;
+    }
+
+    draw(ctx) {
+        const progress = 1 - this.life / this.maxLife;
+        let alpha = 1;
+        if (progress < this.fadeIn) alpha = progress / this.fadeIn;
+        else if (progress > 1 - this.fadeOut) alpha = (1 - progress) / this.fadeOut;
+
+        const twinkleFactor = this.twinkle ? (0.75 + Math.sin(this.seed + progress * 20) * this.twinkle) : 1;
+        const pulseFactor = this.pulse ? (1 + Math.sin(this.seed + progress * 9) * this.pulse) : 1;
+        alpha = clamp(alpha * twinkleFactor, 0, 1);
+
+        if (this.trail && this.history.length > 1) {
+            ctx.save();
+            ctx.lineCap = 'round';
+            for (let i = 0; i < this.history.length - 1; i++) {
+                const p1 = this.history[i];
+                const p2 = this.history[i + 1];
+                const strength = (1 - i / this.history.length) * 0.5;
+                ctx.strokeStyle = hsla(this.color, alpha * strength);
+                ctx.lineWidth = Math.max(0.8, this.size * 0.24 * (1 - i * 0.09));
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        if (this.glow > 0) {
+            ctx.shadowBlur = this.glow;
+            ctx.shadowColor = this.color;
+        }
+
+        if (this.type === 'ring') {
+            ctx.strokeStyle = hsla(this.color, alpha * 0.72);
+            ctx.lineWidth = this.lineWidth + (1 - progress) * 1.5;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+            ctx.stroke();
+        } else if (this.type === 'sparkline') {
+            ctx.translate(this.x, this.y);
+            ctx.rotate(this.rotation);
+            ctx.strokeStyle = hsla(this.color, alpha * 0.8);
+            ctx.lineWidth = this.lineWidth;
+            ctx.beginPath();
+            ctx.moveTo(-this.size, 0);
+            ctx.lineTo(this.size, 0);
+            ctx.moveTo(0, -this.size);
+            ctx.lineTo(0, this.size);
+            ctx.stroke();
+        } else {
+            const radius = this.size * (0.5 + (1 - progress) * 0.24) * pulseFactor;
+            const gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, radius);
+            gradient.addColorStop(0, hsla(this.color, 1));
+            gradient.addColorStop(0.35, hsla(this.color, 0.9));
+            gradient.addColorStop(0.75, hsla(this.color, 0.28));
+            gradient.addColorStop(1, hsla(this.color, 0));
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = hsla(this.color, alpha * 0.55);
+            ctx.lineWidth = this.lineWidth;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, radius * 0.72, 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.fillStyle = `rgba(255,255,255,${alpha * 0.95})`;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, Math.max(1, radius * 0.18), 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.restore();
+    }
+}
+
+function addParticle(p) { particles.push(new Particle(p)); }
+
+function createFallingEmbers(x, y, count, baseColor = palette.warm) {
+    for (let i = 0; i < count; i++) {
+        const angle = randRange(-Math.PI * 0.75, -Math.PI * 0.25);
+        const speed = randRange(1.2, 3.8);
+        addParticle({
+            x: x + randRange(-24, 24),
+            y: y + randRange(-10, 10),
+            vx: Math.cos(angle) * speed * randRange(0.2, 0.55),
+            vy: Math.sin(angle) * speed,
+            size: randRange(3.2, 6.8),
+            lifetime: randRange(54, 90),
+            color: Math.random() < 0.35 ? palette.white : baseColor,
+            gravity: 0.075,
+            drag: 0.988,
+            glow: 10,
+            trail: Math.random() < 0.45,
+            twinkle: 0.16,
+            fadeIn: 0.02,
+            fadeOut: 0.44
+        });
+    }
+}
+
+function createPalmBloom(x, y) {
+    currentColor = randomColor();
+    palette = makePalette(currentColor);
+
+    for (let i = 0; i < 52; i++) {
+        const angle = (Math.PI * 2 * i) / 52 + randRange(-0.05, 0.05);
+        const speed = randRange(2.6, 6.8);
+        addParticle({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - randRange(0.2, 1.0),
+            size: randRange(8, 18),
+            lifetime: randRange(34, 60),
+            color: i % 3 === 0 ? palette.accent : palette.core,
+            gravity: 0.04,
+            drag: 0.985,
+            glow: 18,
+            trail: Math.random() < 0.66,
+            twinkle: 0.18,
+            pulse: 0.05,
+            fadeIn: 0.03,
+            fadeOut: 0.42
+        });
+    }
+
+    for (let i = 0; i < 22; i++) {
+        const angle = randRange(0, Math.PI * 2);
+        const radius = randRange(18, 52);
+        addParticle({
+            x: x + Math.cos(angle) * radius,
+            y: y + Math.sin(angle) * radius,
+            vx: Math.cos(angle) * randRange(0.2, 1.1),
+            vy: Math.sin(angle) * randRange(0.2, 1.1),
+            size: randRange(18, 28),
+            lifetime: randRange(16, 28),
+            color: Math.random() < 0.5 ? palette.soft : palette.warm,
+            gravity: 0.012,
+            drag: 0.976,
+            glow: 26,
+            twinkle: 0.24,
+            pulse: 0.12,
+            fadeIn: 0.02,
+            fadeOut: 0.58
+        });
+    }
+
+    for (let i = 0; i < 16; i++) {
+        addParticle({
+            x, y,
+            size: randRange(4, 8),
+            lifetime: randRange(36, 56),
+            color: i % 2 ? palette.sparkle : palette.white,
+            glow: 14,
+            twinkle: 0.3,
+            pulse: 0.18,
+            orbit: {
+                cx: x, cy: y, angle: randRange(0, Math.PI * 2), radius: randRange(20, 50),
+                speed: randRange(0.05, 0.11) * (Math.random() > 0.5 ? 1 : -1), radiusDecay: 0.992
+            },
+            fadeIn: 0.04,
+            fadeOut: 0.45,
+            lineWidth: 1.2
+        });
+    }
+
+    for (let i = 0; i < 12; i++) {
+        const angle = randRange(0, Math.PI * 2);
+        const speed = randRange(4.6, 8.8);
+        addParticle({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            size: randRange(2.2, 4.6),
+            lifetime: randRange(24, 38),
+            color: i % 2 ? palette.white : palette.sparkle,
+            gravity: 0.024,
+            drag: 0.982,
+            glow: 10,
+            trail: true,
+            twinkle: 0.28,
+            fadeIn: 0.02,
+            fadeOut: 0.62
+        });
+    }
+
+    createFallingEmbers(x, y, 26, palette.warm);
+}
+
+function createFingerFollow(x, y, vx, vy) {
+    const motion = Math.hypot(vx, vy);
+
+    addParticle({
+        x, y,
+        vx: vx * 0.18,
+        vy: vy * 0.18,
+        size: randRange(16, 22),
+        lifetime: randRange(16, 24),
+        color: palette.core,
+        drag: 0.9,
+        glow: 22,
+        trail: true,
+        twinkle: 0.1,
+        pulse: 0.1,
+        fadeIn: 0.04,
+        fadeOut: 0.5
+    });
+
+    addParticle({
+        x, y,
+        vx: vx * 0.08,
+        vy: vy * 0.08,
+        size: randRange(8, 12),
+        lifetime: randRange(20, 32),
+        color: palette.white,
+        drag: 0.94,
+        glow: 12,
+        twinkle: 0.25,
+        pulse: 0.18,
+        fadeIn: 0.04,
+        fadeOut: 0.55
+    });
+
+    const sparkleCount = motion > 8 ? 7 : 5;
+    for (let i = 0; i < sparkleCount; i++) {
+        const angle = randRange(0, Math.PI * 2);
+        const speed = randRange(0.8, 2.4) + motion * 0.03;
+        addParticle({
+            x: x + randRange(-4, 4),
+            y: y + randRange(-4, 4),
+            vx: Math.cos(angle) * speed + vx * 0.06,
+            vy: Math.sin(angle) * speed + vy * 0.06,
+            size: randRange(4.5, 9),
+            lifetime: randRange(16, 28),
+            color: i % 3 === 0 ? palette.sparkle : (i % 2 === 0 ? palette.accent : palette.soft),
+            gravity: 0.006,
+            drag: 0.95,
+            glow: 10,
+            trail: Math.random() < 0.45,
+            twinkle: 0.24,
+            pulse: 0.08,
+            fadeIn: 0.05,
+            fadeOut: 0.6
+        });
+    }
+}
+
+function createFistPulse(x, y) {
+    currentColor = randomColor();
+    palette = makePalette(currentColor);
+
+    addParticle({ x, y, size: 16, lifetime: 26, color: palette.white, glow: 24, pulse: 0.25, fadeIn: 0.02, fadeOut: 0.55 });
+    addParticle({ x, y, size: 20, lifetime: 30, color: palette.pulse, type: 'ring', ringGrowth: 7.2, glow: 20, lineWidth: 3, fadeIn: 0.02, fadeOut: 0.48 });
+    addParticle({ x, y, size: 36, lifetime: 36, color: palette.accent, type: 'ring', ringGrowth: 5.4, glow: 18, lineWidth: 2, fadeIn: 0.02, fadeOut: 0.48 });
+
+    for (let i = 0; i < 18; i++) {
+        const angle = randRange(0, Math.PI * 2);
+        const speed = randRange(2.4, 5.4);
+        addParticle({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            size: randRange(4, 8),
+            lifetime: randRange(22, 40),
+            color: i % 2 ? palette.pulse : palette.white,
+            gravity: 0.03,
+            drag: 0.97,
+            glow: 12,
+            trail: true,
+            twinkle: 0.22,
+            fadeIn: 0.03,
+            fadeOut: 0.58
+        });
+    }
+
+    for (let i = 0; i < 8; i++) {
+        addParticle({
+            x, y,
+            size: randRange(8, 14),
+            lifetime: randRange(20, 32),
+            color: palette.soft,
+            type: 'sparkline',
+            lineWidth: 1.5,
+            radiusV: randRange(-0.2, 0.2),
+            glow: 14,
+            fadeIn: 0.02,
+            fadeOut: 0.55
+        });
+    }
+}
+
+function drawAnchor(x, y, gesture) {
+    if (gesture === 'none') return;
+    ctx.save();
+    const stroke = gesture === 'fist' ? hsla(palette.pulse, 0.9) : gesture === 'open_palm' ? hsla(palette.soft, 0.86) : hsla(palette.accent, 0.9);
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = gesture === 'open_palm' ? 2.8 : 2;
+    ctx.shadowBlur = 18;
+    ctx.shadowColor = stroke;
+
+    if (gesture === 'open_palm') {
+        ctx.beginPath(); ctx.arc(x, y, 26, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 12, 0, Math.PI * 2); ctx.stroke();
+    } else if (gesture === 'index_finger') {
+        ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 26, -Math.PI * 0.25, Math.PI * 0.55); ctx.stroke();
+    } else if (gesture === 'fist') {
+        ctx.beginPath(); ctx.arc(x, y, 18, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 34, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+}
+
+function getPalmCenter(landmarks) {
+    const ids = [0, 1, 2, 5, 9, 13, 17];
+    let x = 0, y = 0;
+    ids.forEach(id => { x += landmarks[id].x; y += landmarks[id].y; });
+    return { x: x / ids.length, y: y / ids.length };
+}
+
+function getHandScale(landmarks) {
+    return distance(landmarks[0], landmarks[9]) + distance(landmarks[5], landmarks[17]);
+}
+
+function smoothLandmarks(landmarks) {
+    if (!filteredLandmarks) {
+        filteredLandmarks = landmarks.map(p => ({ x: p.x, y: p.y, z: p.z || 0 }));
+        return filteredLandmarks;
+    }
+    filteredLandmarks = landmarks.map((point, i) => ({
+        x: lerp(filteredLandmarks[i].x, point.x, LANDMARK_LERP),
+        y: lerp(filteredLandmarks[i].y, point.y, LANDMARK_LERP),
+        z: lerp(filteredLandmarks[i].z || 0, point.z || 0, 0.45)
+    }));
+    return filteredLandmarks;
+}
+
+function fingerStraight(landmarks, pip, dip, tip) {
+    return landmarks[tip].y < landmarks[pip].y && landmarks[dip].y < landmarks[pip].y;
+}
+
+function fingerFolded(landmarks, pip, tip, palmCenter, threshold) {
+    return landmarks[tip].y >= landmarks[pip].y || distance(landmarks[tip], palmCenter) < threshold;
+}
+
+function thumbOpen(landmarks, palmCenter, scale) {
+    return distance(landmarks[4], palmCenter) > scale * 0.24 && Math.abs(landmarks[4].x - landmarks[3].x) > scale * 0.045;
+}
+
+function detectGesture(landmarks) {
+    const palmCenter = getPalmCenter(landmarks);
+    const scale = getHandScale(landmarks);
+    const foldThreshold = scale * 0.26;
+
+    const indexStraight = fingerStraight(landmarks, 6, 7, 8) && distance(landmarks[8], palmCenter) > scale * 0.34;
+    const middleStraight = fingerStraight(landmarks, 10, 11, 12) && distance(landmarks[12], palmCenter) > scale * 0.34;
+    const ringStraight = fingerStraight(landmarks, 14, 15, 16) && distance(landmarks[16], palmCenter) > scale * 0.31;
+    const pinkyStraight = fingerStraight(landmarks, 18, 19, 20) && distance(landmarks[20], palmCenter) > scale * 0.28;
+    const thumbSpread = thumbOpen(landmarks, palmCenter, scale);
+
+    if (indexStraight && middleStraight && ringStraight && pinkyStraight && thumbSpread) {
+        return { gesture: 'open_palm', anchor: palmCenter, confidence: 0.96 };
+    }
+
+    const middleFolded = fingerFolded(landmarks, 10, 12, palmCenter, foldThreshold);
+    const ringFolded = fingerFolded(landmarks, 14, 16, palmCenter, foldThreshold);
+    const pinkyFolded = fingerFolded(landmarks, 18, 20, palmCenter, foldThreshold);
+    const thumbFolded = distance(landmarks[4], palmCenter) < scale * 0.31;
+
+    if (indexStraight && middleFolded && ringFolded && pinkyFolded && thumbFolded) {
+        return { gesture: 'index_finger', anchor: landmarks[8], confidence: 0.94 };
+    }
+
+    const fistGesture = !indexStraight && middleFolded && ringFolded && pinkyFolded && distance(landmarks[8], palmCenter) < scale * 0.24 && distance(landmarks[12], palmCenter) < scale * 0.22 && distance(landmarks[16], palmCenter) < scale * 0.2 && distance(landmarks[20], palmCenter) < scale * 0.2;
+    if (fistGesture) {
+        return { gesture: 'fist', anchor: palmCenter, confidence: 0.92 };
+    }
+
+    return { gesture: 'none', anchor: palmCenter, confidence: 0.2 };
+}
+
+function updateGestureDisplay(gesture) {
+    gestureDisplay.textContent = GESTURE_NAMES[gesture] || GESTURE_NAMES.none;
+}
+
+function toCanvasPoint(p) {
+    return { x: (1 - p.x) * canvasWidth, y: p.y * canvasHeight };
+}
+
+function drawDreamGlow() {
+    const radius = stableGesture === 'open_palm' ? 180 : stableGesture === 'fist' ? 150 : 120;
+    const g = ctx.createRadialGradient(smoothedPosition.x, smoothedPosition.y, 0, smoothedPosition.x, smoothedPosition.y, radius);
+    g.addColorStop(0, hsla(palette.soft, stableGesture === 'none' ? 0 : 0.08));
+    g.addColorStop(0.45, hsla(palette.core, stableGesture === 'none' ? 0 : 0.04));
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.save();
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(smoothedPosition.x, smoothedPosition.y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+}
+
+function drawHandAura() {
+    if (!drawLandmarks || !handVisible) return;
+
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    const stroke = stableGesture === 'fist' ? palette.pulse : stableGesture === 'open_palm' ? palette.soft : stableGesture === 'index_finger' ? palette.accent : palette.core;
+
+    for (const [a, b] of HAND_CONNECTIONS) {
+        const p1 = toCanvasPoint(drawLandmarks[a]);
+        const p2 = toCanvasPoint(drawLandmarks[b]);
+        ctx.strokeStyle = hsla(stroke, 0.18);
+        ctx.lineWidth = 10;
+        ctx.shadowBlur = 22;
+        ctx.shadowColor = hsla(stroke, 0.65);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+
+        ctx.strokeStyle = hsla(palette.white, 0.18);
+        ctx.lineWidth = 2.2;
+        ctx.shadowBlur = 0;
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+    }
+
+    const important = stableGesture === 'index_finger' ? [8, 5, 6, 7] : [0, 5, 9, 13, 17];
+    important.forEach(id => {
+        const p = toCanvasPoint(drawLandmarks[id]);
+        ctx.fillStyle = hsla(stroke, 0.28);
+        ctx.shadowBlur = 18;
+        ctx.shadowColor = hsla(stroke, 0.85);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, id === 8 ? 14 : 9, 0, Math.PI * 2);
+        ctx.fill();
+    });
+    ctx.restore();
+}
+
+function animate(now = performance.now()) {
+    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+    const smoothing = handVisible ? POSITION_LERP_FAST : POSITION_LERP_IDLE;
+    smoothedPosition.x = lerp(smoothedPosition.x, targetPosition.x, smoothing);
+    smoothedPosition.y = lerp(smoothedPosition.y, targetPosition.y, smoothing);
+
+    if (!handVisible && now - lastSeenTime > LOST_HAND_DECAY) {
+        stableGesture = 'none';
+        gestureMetaDiv.textContent = 'Tracking: waiting for hand';
+        modeMetaDiv.textContent = 'Mode: idle';
+    }
+
+    drawDreamGlow();
+    drawHandAura();
+
+    if (stableGesture === 'open_palm' && now - lastPalmBurstTime > PALM_BURST_COOLDOWN) {
+        createPalmBloom(smoothedPosition.x, smoothedPosition.y);
+        lastPalmBurstTime = now;
+    }
+
+    const moveVx = smoothedPosition.x - previousSmoothedPosition.x;
+    const moveVy = smoothedPosition.y - previousSmoothedPosition.y;
+
+    if (stableGesture === 'index_finger' && now - lastFingerEmitTime > FINGER_EMIT_INTERVAL) {
+        createFingerFollow(smoothedPosition.x, smoothedPosition.y, moveVx, moveVy);
+        lastFingerEmitTime = now;
+    }
+
+    if (stableGesture === 'fist' && now - lastFistPulseTime > FIST_PULSE_COOLDOWN) {
+        createFistPulse(smoothedPosition.x, smoothedPosition.y);
+        lastFistPulseTime = now;
+    }
+
+    const aliveParticles = [];
+    const start = particles.length > MAX_PARTICLES ? particles.length - MAX_PARTICLES : 0;
+    for (let i = start; i < particles.length; i++) {
+        const particle = particles[i];
+        if (particle.update()) {
+            particle.draw(ctx);
+            aliveParticles.push(particle);
+        }
+    }
+    particles = aliveParticles;
+
+    drawAnchor(smoothedPosition.x, smoothedPosition.y, stableGesture);
+    particleCountDiv.textContent = `Particles: ${particles.length}/${MAX_PARTICLES}`;
+    modeMetaDiv.textContent = `Mode: ${stableGesture === 'none' ? 'idle' : stableGesture.replace('_', ' ')}`;
+
+    previousSmoothedPosition.x = smoothedPosition.x;
+    previousSmoothedPosition.y = smoothedPosition.y;
+    requestAnimationFrame(animate);
+}
+
+const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+
+hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.72,
+    minTrackingConfidence: 0.72
+});
+
+hands.onResults((results) => {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        handVisible = true;
+        lastSeenTime = performance.now();
+
+        const landmarks = smoothLandmarks(results.multiHandLandmarks[0]);
+        drawLandmarks = landmarks;
+        const { gesture, anchor, confidence } = detectGesture(landmarks);
+        confidenceScore = confidence;
+
+        if (gesture === rawGesture) gestureFrames++;
+        else { rawGesture = gesture; gestureFrames = 1; }
+
+        const nextTarget = { x: (1 - anchor.x) * canvasWidth, y: anchor.y * canvasHeight };
+        const jumpDistance = distance(nextTarget, targetPosition);
+        if (jumpDistance < JUMP_REJECT_DISTANCE || stableGesture !== gesture || gesture === 'open_palm' || gesture === 'fist') {
+            targetPosition = nextTarget;
+        } else {
+            targetPosition = { x: lerp(targetPosition.x, nextTarget.x, 0.18), y: lerp(targetPosition.y, nextTarget.y, 0.18) };
+        }
+
+        if (gestureFrames >= GESTURE_LOCK_FRAMES && stableGesture !== gesture) {
+            stableGesture = gesture;
+            if (stableGesture !== 'none') {
+                currentColor = randomColor();
+                palette = makePalette(currentColor);
+            }
+            updateGestureDisplay(stableGesture);
+            if (stableGesture === 'open_palm') {
+                createPalmBloom(targetPosition.x, targetPosition.y);
+                lastPalmBurstTime = performance.now();
+            } else if (stableGesture === 'fist') {
+                createFistPulse(targetPosition.x, targetPosition.y);
+                lastFistPulseTime = performance.now();
+            }
+        } else {
+            updateGestureDisplay(stableGesture);
+        }
+
+        gestureMetaDiv.textContent = `Tracking: ${stableGesture === 'none' ? rawGesture : stableGesture} · confidence ${(confidenceScore * 100).toFixed(0)}%`;
+    } else {
+        handVisible = false;
+        rawGesture = 'none';
+        gestureFrames = 0;
+        filteredLandmarks = null;
+        drawLandmarks = null;
+        if (stableGesture !== 'none') {
+            stableGesture = 'none';
+            updateGestureDisplay('none');
+        }
+        gestureMetaDiv.textContent = 'Tracking: hand lost';
+        modeMetaDiv.textContent = 'Mode: idle';
+    }
+});
+
+async function setupCamera() {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                width: { ideal: 1280, max: 1280 },
+                height: { ideal: 720, max: 720 },
+                frameRate: { ideal: 30, max: 30 },
+                facingMode: 'user'
+            }
+        });
+
+        videoElement.srcObject = stream;
+        statusDiv.textContent = '✓ Camera Active';
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                const now = performance.now();
+                if (handProcessing || now - lastHandInferenceTime < HAND_INFERENCE_INTERVAL) return;
+                handProcessing = true;
+                lastHandInferenceTime = now;
+                try {
+                    await hands.send({ image: videoElement });
+                } finally {
+                    handProcessing = false;
+                }
+            },
+            width: 1280,
+            height: 720
+        });
+
+        camera.start();
+        animate();
+    } catch (error) {
+        console.error('Camera error:', error);
+        statusDiv.textContent = '✗ Camera Error';
+        statusDiv.style.color = '#f44336';
+        errorDiv.style.display = 'block';
+    }
+}
+
+window.addEventListener('resize', syncCanvasSize);
+
+setupCamera();
+    </script>
+</body>
+</html>
